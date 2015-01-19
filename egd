@@ -540,7 +540,7 @@ class EntropySource:
 		'''Fetches entropy by calling the function object associated with key 'function'
 		in self.sourceDict.
 		'''
-		
+
 		# The data is obtained by calling the function with no arguments.
 		function = self['function']
 
@@ -726,7 +726,7 @@ class Config(Singleton):
 			# dictionary as the second parameter to exec().  It will capture any global
 			# variable assignments made by the config file code.
 			exec(configFileData, { 'log': log }, self.configDict)
-	
+
 		except:
 			# Something went wrong.
 			log.exception('Exception reading config file ({0}):'.format(configFile))
@@ -842,7 +842,7 @@ class EGDServer(Singleton):
 		'''Stops the TCP server thread.'''
 
 		# Command the thread to stop.
-		self.server.shutdown()		
+		self.server.shutdown()
 
 		# Wait for it to stop.
 		self.thread.join()
