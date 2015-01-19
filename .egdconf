@@ -1,0 +1,455 @@
+# -*- python -*-
+#
+# This is the Entropy Gathering Daemon (EGD) configuration file.  Do not execute this
+# file.  Variables assigned in this file become configuration parameters available to
+# EGD.  This file can import modules and define functions/classes as needed to do its
+# work, but it's main purpose is to assign variables.  Any variables, functions,
+# classes, and imported modules that are not needed by EGD should be deleted (using
+# "del name") after they are used, so as not to pollute the EGD configuration data
+# with unneeded names.
+#
+# Code in this file does not have access to any globals in the EGD module, with the
+# exception of global variable 'log' which is an alias for the logging module.  It
+# can be used to log messages to the EGD log file to from this file.
+#
+# Only certain variables are meaningful to EGD.  These are documented below in the
+# "Configuration Parameters" section.  All others are ignored.
+#
+# Defining Entropy Sources
+# ------------------------
+#
+# A variable name of the form "source..." defines an entropy source.  A variable of
+# the form "disabled_source..." defines a disabled entropy source.  A disabled source
+# will be ignored by EGD.  The value assigned to the variable must be a dictionary
+# containing the following keys (some of which are optional):
+#
+#	name, interval, url, urlfunction, file, cmd, function, size, minsize, scale,
+#	nocompress, initdelay, prefetch
+#
+# where:
+#
+# o NAME specifies a friendly name for this entropy source.
+#
+# o INTERVAL specifies the minimum interval in seconds between fetches of this
+#   entropy source.
+# 
+# o URL, URLFUNCTION, FILE, and CMD are mutually exclusive.  Only one should appear.
+#
+# o URL specifies an HTTP URL from which to download data.  If URL appears, optional
+#   key SIZE specifies how many bytes to read from the URL.
+#
+# o URLFUNCTION specifies a function to call to obtain the URL from which to download
+#   data.  If URLFUUNCTION appears, optional key SIZE specifies how many bytes to
+#   read from the URL.
+#
+# o FILE specifies the name of a file to read to obtain data.  The file is read in
+#   binary mode.  If FILE appears, optional key SIZE specifies how many bytes to read
+#   from the specified file (otherwise the entire file is read).
+#
+# o CMD specifies a program to run (with optional arguments) in the form of a list,
+#   where the first element is the name of the program and the 2nd and subsequent
+#   elements are the optional arguments to pass to the program.  The standard output
+#   of the command is used as the entropy data.  The command is not passed to the
+#   shell.
+#
+# o FUNCTION specifies a function object to call to obtain the data.  The data must be
+#   returns as a bytes or bytearray object.
+#
+# o MINSIZE is optional.  If present, it specifies the minimum number of bytes of
+#   data that must be downloaded.  If less than the minimum is downloaded, the data
+#   is ignored.  This is useful to ignore error pages returned when fetching
+#   time-based URLs that may not always provide the desired data.
+#
+# o SCALE is optional.  It specifies a floating point value in the range 0 to 1 by
+#   which to multiply the resulting entropy before adding it to the entropy pool.
+#   This allows you to override the entropy calculation by reducing the entropy.  For
+#   instance, if SCALE is 0.1, and the computed entropy is 1200 bits, the pool will
+#   receive only 120 = 1200 * 0.1 bits of entropy.
+#
+# o NOCOMPRESS is optional.  If it appears with any value, no compression will be
+#   performed on the data.  This is valuable with really high entropy data (e.g.,
+#   /dev/random), because doing LZMA compression on such data can result in an
+#   increase in size.
+#
+# o INITDELAY is optional.  If it appears, it specifies the time to delay (in secnods)
+#   before making the first fetch of this source.
+#
+# o PREFETCH is optional.  If it appears, it specifies an URL to be fetched before
+#   fetching the data specified by URL or URLFUNCTION.  This is needed to get data
+#   from some sites (sich as the Naval Research Lab).
+
+################################################################################
+# Configuration Parameters.
+
+import os, logging
+
+# The default log level.  See https://docs.python.org/3/library/logging.html for details.
+logLevel = logging.INFO
+
+# The maximum number of bytes of entropy the pool can can contain.
+maxEntropy = 10 * 1024 * 1024  # 10 MB
+
+# The file where the entropy pool is periodically persisted for safety.
+persistFile = os.environ['HOME'] + r'/.egdentropy'
+
+# The periodic interval (in seconds) after which the entropy pool should be persisted
+# to the file specified by parameter persistFile.
+persistInterval = 600
+
+# The maximum number of bytes of entropy each PoolChunk object can contain.
+poolChunkMaxEntropy = 8192
+
+# The TCP port number on which the EGD daemon listens for commands from the EGD
+# command-line utility.
+tcpPort = 2121
+
+del os, logging
+
+################################################################################
+# Entropy Sources.
+
+# --------------------------------------------------------------------------------
+# 1000 bytes from /dev/random.  Entropy: ~1000 bytes before scaling.
+
+import os
+
+# os.name is 'posix' under Cygwin's python3.
+if os.name == 'posix':
+	source_DevRandom = dict(name = '/dev/random',
+							interval = 300,  # 5 minutes
+							file = '/dev/random',
+							size = 1000,
+							nocompress = True,
+							scale = 0.8)
+elif os.name == 'nt':
+	# When using the Windows install of Python3, of this is so that Cygwin's dd.exe
+	# will run without flashing a console window on the screen.  We launch dd.exe
+	# using daemonize.exe, so that dd.exe doesn't show a console window, and use dd's
+	# of=... option to write the data to a temp file.  Then we read the temp file.
+	# Ugh.
+	def getDevRandomBytes():
+		import os, subprocess, time
+		tmpfile = r'c:\temp\egd.tmp'
+		command = [ r'c:\franl\bin\win32\x86\daemonize.exe', '/bin/dd', 'if=/dev/random',
+					'of=/cygdrive/c/temp/egd.tmp', 'bs=1', 'count=1000' ]
+		try:
+			subprocess.call(command, shell = False, universal_newlines = False, timeout = 30,
+							stderr = subprocess.DEVNULL)
+			time.sleep(5)
+			with open(tmpfile, 'rb') as file:
+				data = file.read()
+			return bytearray(data)
+		except:
+			log.exception('Exception obtaining data from entropy source "/dev/random":')
+			return bytearray()
+		finally:
+			try:
+				os.remove(tmpfile)
+			except:
+				pass
+
+	source_DevRandom = dict(name = '/dev/random',
+							interval = 300,  # 5 minutes
+							function = getDevRandomBytes,
+							nocompress = True,
+							scale = 0.8)
+
+	del getDevRandomBytes
+
+del os
+
+# --------------------------------------------------------------------------------
+# 1000 hexadecimal integers in the range 0 to 1,000,000,000 from random.org.
+# Entropy: ~4500 bytes after compression/stirring and before scaling.
+
+source_RandomOrg = dict(name = 'random.org',
+						interval = 14400,  # 4 hours
+						url = 'http://www.random.org/integers/?num=1000&min=1&max=1000000000&col=1&base=16&format=plain&rnd=new',
+						scale = 0.9)
+
+# --------------------------------------------------------------------------------
+# Today's Astronomy Picture of the Day.  Entropy: ~50-150 KB after
+# compression/stirring and before scaling.
+
+def getApodImageURL():
+	import urllib.request, re
+	httpResponse = urllib.request.urlopen("http://apod.nasa.gov/apod/")
+	data = httpResponse.read().decode()
+	match = re.search(r'<img src="([^"]+)"', data, re.IGNORECASE)
+	if match:
+		return "http://apod.nasa.gov/apod/" + match.group(1)
+	# The regex match will fail if APOD is showing a video, so return an empty string.
+	# EGD will log an error.
+	return ''
+
+source_APOD = dict(name = 'Astronomy Picture of the Day',
+				   interval = 86400,  # 1 day
+				   urlfunction = getApodImageURL,
+				   size = 150000,
+				   scale = 0.1)
+
+del getApodImageURL
+
+# --------------------------------------------------------------------------------
+# The first ~22 seconds of NPR's Hourly Newscast.  Entropy: ~140 KB after
+# compression/stirring and before scaling.
+
+source_NPRHourlyNewsAudio = dict(name = 'NPR hourly news audio',
+								 interval = 6000,  # 1 hour 40 minutes
+								 url = 'http://public.npr.org/anon.npr-mp3/npr/news/newscast.mp3',
+								 size = 150000,
+								 scale = 0.2)
+
+# --------------------------------------------------------------------------------
+# Naval Research Laboratory world satellite image.  See
+# http://www.nrlmry.navy.mil/sat_products.html for more.  Updated every three hours
+# (00, 03, ...).  Entropy: ~370 KB after compression/stirring and before scaling.
+
+def getNRLWorldSatelliteURL():
+	import time
+	now = time.gmtime(time.time() - 4 * 3600)  # Get images from 4 hours ago.
+	baseUrl = 'http://www.nrlmry.navy.mil/archdat/global/stitched/day_night_bm/{0}{1:02}{2:02}.{3:02}00.multisat.visir.bckgr.Global_Global_bm.DAYNGT.jpg'
+	url = baseUrl.format(now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour // 3 * 3)
+	#log.info('url = {0}'.format(url))
+	return url
+
+source_NRLWorldSat = dict(name = 'NRL world visible/IR satellite image',
+						  interval = 10800,  # 3 hours
+						  urlfunction = getNRLWorldSatelliteURL,
+						  minsize = 20000,
+						  scale = 0.05)
+
+del getNRLWorldSatelliteURL
+
+# --------------------------------------------------------------------------------
+# Naval Research Laboratory North America composite visible/IR satellite image.
+# Updated every 15 hours.  Entropy: ~1.5 MB after compression/stirring and before
+# scaling.
+
+source_NRLNorthAmericaIRSat = dict(name = 'NRL North America visible/IR satellite image',
+								   interval = 54000,  # 15 hours
+								   url = 'http://www.nrlmry.navy.mil/htdocs_dyn_pregen_sat/PUBLIC/nexsat/gif89/CONUS/focus_regions/NorthAmerica-CONUS-x/x-x-x/vis_ir_background/goes/LATEST.gif',
+								   size = 1500000,
+								   minsize = 20000,
+								   scale = 0.008)
+
+# --------------------------------------------------------------------------------
+# NOAA North America water vapor satellite image.  Updated every hour.  Entropy:
+# ~77000 bytes after compression/stirring and before scaling.
+
+def getNOAANorthAmericaWaterVaporSatelliteURL():
+	import time
+	now = time.localtime(time.time() - 2 * 3600)  # Get image from 2 hours ago.
+	baseUrl = 'http://www.ssd.noaa.gov/PS/PCPN/DATA/RT/NA/WV/{0}.jpg'
+	url = baseUrl.format(now.tm_hour)
+	#log.info('url =', url)
+	return url
+
+source_NOAANorthAmericaWaterVaporSat = dict(name = 'NOAA North America water vapor satellite image',
+											interval = 10800,  # 1 hour
+											urlfunction = getNOAANorthAmericaWaterVaporSatelliteURL,
+											minsize = 20000,
+											scale = 0.05)
+
+del getNOAANorthAmericaWaterVaporSatelliteURL
+
+# --------------------------------------------------------------------------------
+# NOAA GOES North America infrared satellite image.  Updated every hour.  Entropy:
+# ~99000 bytes after compression/stirring and before scaling.
+
+def getNOAANorthAmericaIRSatelliteURL():
+	import time
+	now = time.localtime(time.time() - 2 * 3600)  # Get image from 2 hours ago.
+	baseUrl = 'http://www.ssd.noaa.gov/PS/PCPN/DATA/RT/NA/IR4/{0}.jpg'
+	url = baseUrl.format(now.tm_hour)
+	#log.info('url =', url)
+	return url
+
+source_NOAANorthAmericaIRSat = dict(name = 'NOAA North America infrared satellite image',
+									interval = 10800,  # 1 hour
+									urlfunction = getNOAANorthAmericaIRSatelliteURL,
+									minsize = 20000,
+									scale = 0.05)
+
+del getNOAANorthAmericaIRSatelliteURL
+
+# --------------------------------------------------------------------------------
+# NOAA GOES North America rainbow infrared satellite image.  Updated every half hour.
+# Entropy: ~800,000 bytes after compression/stirring and before scaling.
+
+source_NOAANorthAmericaRBIRSat = dict(name = 'NOAA North America rainbow infrared satellite image',
+									  interval = 10800,  # 1 hour
+									  url = 'http://www.ssd.noaa.gov/goes/comp/nhem/rb.jpg',
+									  minsize = 20000,
+									  scale = 0.008)
+
+# --------------------------------------------------------------------------------
+# NOAA GOES North America rainbow infrared satellite image.  Updated every ???.
+# Entropy: ~120,000 bytes after compression/stirring and before scaling.
+
+source_NOAAEastAtlanticRBIRSat = dict(name = 'NOAA East Atlantic rainbow infrared satellite image',
+									  interval = 10800,  # 1 hour
+									  url = 'http://www.ssd.noaa.gov/eumet/eatl/rb.jpg',
+									  minsize = 20000,
+									  scale = 0.05)
+
+# --------------------------------------------------------------------------------
+# NOAA GOES Northwest Pacific rainbow infrared satellite image.  Updated every ???.
+# Entropy: ~124,000 bytes after compression/stirring and before scaling.
+
+source_NOAANorthwestPacificRBIRSat = dict(name = 'NOAA Northwest Pacific rainbow infrared satellite image',
+										  interval = 10800,  # 1 hour
+										  url = 'http://www.ssd.noaa.gov/mtsat/nwpac/rb.jpg',
+										  minsize = 20000,
+										  scale = 0.05)
+
+# --------------------------------------------------------------------------------
+# 1000 32-bit hexadecimal numbers from the Australian National University Quantum
+# Random Numbers Server.  Entropy: ~4000 bytes after compression/stirring and before
+# scaling.
+
+def getANUNumbers():
+	import urllib.request
+	url = 'http://qrng.anu.edu.au/API/jsonI.php?type=hex16&length=1000&size=4'
+	httpResponse = urllib.request.urlopen(url)
+	data = httpResponse.read().decode()
+	# Reduce data to just the hex digits from the JSON string.
+	prefix, sep, data = data.partition('["')
+	data, sep, suffix = data.partition('"]')
+	data = data.replace('","', '')
+	if data != "":
+		return bytearray(data, 'utf-8')
+	return bytearray()
+
+source_ANUQuantum = dict(name = 'ANU Quantum Random Numbers Server',
+						 interval = 21600,  # 6 hours
+						 function = getANUNumbers,
+						 scale = 0.9)
+
+del getANUNumbers
+
+# --------------------------------------------------------------------------------
+# NIST Randomness Beacon.  Entropy: ~64 bytes after compression/stirring and before
+# scaling.
+
+def nistBeacon():
+	import urllib.request, re, time
+	# Get the data from 80 seconds ago to be sure the data is there.  It's only updated
+	# once a minute.
+	seconds = round(time.time() - 80)
+	httpResponse = urllib.request.urlopen('https://beacon.nist.gov/rest/record/' + str(seconds))
+	data = httpResponse.read().decode()
+	match = re.search(r'<outputvalue>([0-9a-f]+)</outputvalue>', data, re.IGNORECASE)
+	if match:
+		return bytearray(match.group(1), 'utf-8')
+	return bytearray()
+
+source_NISTBeacon = dict(name = 'NIST Hardware Random Numbers Beacon',
+						 interval = 300,  # 5 minutes
+						 function = nistBeacon,
+						 scale = 0.9)
+
+del nistBeacon
+
+# --------------------------------------------------------------------------------
+# Hotbits Random Numbers from radioactive decay measurements.  Entropy: 1024 bytes
+# after compression/stirring and before scaling.
+
+def getHotbitsNumbers():
+	import urllib.request, re
+	httpResponse = urllib.request.urlopen('https://www.fourmilab.ch/cgi-bin/Hotbits?nbytes=2048&fmt=hex')
+	data = httpResponse.read().decode()
+	match = re.search(r'<pre>([0-9a-f\n]+)</pre>', data, re.IGNORECASE)
+	if match:
+		result = match.group(1).replace('\n', '')
+		return bytearray(result, 'utf-8')
+	return bytearray()
+
+source_Hotbits = dict(name = 'Hotbits Radioactive Decay Random Numbers',
+					  interval = 21600,  # 6 hours
+					  initdelay = 3600,  # 1 hour
+					  function = getHotbitsNumbers,
+					  scale = 0.8)
+
+del getHotbitsNumbers
+
+# --------------------------------------------------------------------------------
+# NPR News RSS feed.  Entropy: ~3500 bytes after compression/stirring and before
+# scaling.
+
+source_NPRRSS = dict(name = 'NPR News RSS Feed',
+					 interval = 21600,  # 6 hours
+					 url = 'http://www.npr.org/rss/rss.php?id=1001',
+					 scale = 0.1)
+
+# --------------------------------------------------------------------------------
+# BCC World News RSS feed.  Entropy: ~6600 bytes after compression/stirring and
+# before scaling.
+
+source_BBCRSS = dict(name = 'BBC World News RSS Feed',
+					 interval = 21600,  # 6 hours
+					 url = 'http://feeds.bbci.co.uk/news/world/rss.xml',
+					 scale = 0.1)
+
+# --------------------------------------------------------------------------------
+# Reuters News RSS feed.  Entropy: ~6600 bytes after compression/stirring and before
+# scaling.
+
+source_ReutersRSS = dict(name = 'Reuters News RSS Feed',
+						 interval = 28800,  # 8 hours
+						 url = 'http://feeds.reuters.com/reuters/topNews',
+						 scale = 0.1)
+
+# --------------------------------------------------------------------------------
+# The Register UK News RSS feed.  Entropy: ~10000 bytes after compression/stirring
+# and before scaling.
+
+source_RegisterRSS = dict(name = 'The Register UK News RSS Feed',
+						  interval = 21600,  # 6 hours
+						  url = 'http://www.theregister.co.uk/headlines.atom',
+						  scale = 0.1)
+
+# --------------------------------------------------------------------------------
+# TechCrunch News RSS feed.  Entropy: ~12000 bytes after compression/stirring and
+# before scaling.
+
+source_TechCrunchrRSS = dict(name = 'TechCrunch News RSS Feed',
+							 interval = 21600,  # 6 hours
+							 url = 'http://feeds.feedburner.com/TechCrunch',
+							 scale = 0.1)
+
+# --------------------------------------------------------------------------------
+# Ars Technica RTSS feed.  Entropy: ~31000 bytes after compression/stirring and before
+# scaling.
+
+source_ArsTechnicaRSS = dict(name = 'Ars Technica RSS Feed',
+							 interval = 21600,  # 6 hours
+							 url = 'http://feeds.arstechnica.com/arstechnica/index',
+							 scale = 0.1)
+
+# --------------------------------------------------------------------------------
+# Engadget RSS feed.  Entropy: ~25000 bytes after compression/stirring and before
+# scaling.
+
+source_EngadgetRSS = dict(name = 'Engadget News RSS Feed',
+						  interval = 21600,  # 6 hours
+						  url = 'http://www.engadget.com/rss-full.xml',
+						  scale = 0.05)
+
+# --------------------------------------------------------------------------------
+# Science Daily Top News RSS feed.  Entropy: ~15000 bytes after compression/stirring
+# and before scaling.
+
+source_ScienceDailyTopNewsRSS = dict(name = 'Science Daily Top News RSS Feed',
+									 interval = 21600,  # 6 hours
+									 url = 'http://feeds.sciencedaily.com/sciencedaily/top_news',
+									 scale = 0.1)
+
+# --------------------------------------------------------------------------------
+# Wired RSS feed.  Entropy: ~7800 bytes after compression/stirring and before
+# scaling.
+
+source_WiredRSS = dict(name = 'Wired RSS Feed',
+					   interval = 21600,  # 6 hours
+					   url = 'http://feeds.wired.com/wired/index',
+					   scale = 0.1)

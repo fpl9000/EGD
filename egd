@@ -1,0 +1,1473 @@
+#!/bin/env python3
+# -*- python -*-
+
+# This module implements an Entropy Gathering Daemon.  See the "Module Documentation"
+# section below for how to use it.
+#
+# Things to do:
+#
+# o Improve sendDaemonCommand so it can receive more than 1024 bytes from the daemon.
+#   Maybe have the daemon send the size of the data in the status line: "100 OK
+#   SIZE"?
+#
+# o Implement "--getentropy N" option to get N bytes of entropy from the pool.
+#   Depends on previous item.
+#
+# o Support operator 'in' on class EntropySource by implementing method
+#   __contains__(self, item).
+#
+# o Use subprocess.Popen to spawn the daemon with Windows Python.
+#
+# o Finish the module's __doc__ string.
+#
+# Notes:
+#
+# o How to compute the entropy of a byte stream:
+#
+#	https://troydhanson.github.io/misc/Entropy.html
+
+import sys, os, collections, re, threading, hashlib, logging, time, subprocess, \
+	   urllib.request, socket, socketserver, pickle, resource, traceback
+
+# GLOBALS:
+#
+# There are just a few globals in this module:
+#
+# o pool: This is the EntropyPool singleton.  Since it's what this module is all
+#   about, we make it global.
+#
+# o log: An alias for the logging module.  This is global to save typing for
+#   generating log messages.
+#
+# o havelzma: This is True if module lzma is available (Python 3.3 or later).  We use
+#   this in a few places to know whether to compress data with LZMA or BZ2.
+
+if sys.version_info[0] > 3 or (sys.version_info[0] == 3 and sys.version_info[1] > 2):
+	# LZMA compression is only available in Python 3.3 and up.
+	import lzma
+	havelzma = True
+else:
+	import bz2
+	havelzma = False
+
+################################################################################
+# Module documentation.
+
+__doc__ = \
+	'''This module implements an Entropy Gathering Daemon (EGD).  Interactively, a
+	command-line interface allows control of the daemon process.  Module level
+	functions provide an API equivalent to the command-line interface.  Classes
+	implement the core features of the module API and the daemon.
+
+	UNDER CONSTRUCTION
+	'''
+
+################################################################################
+# This function is monkey-patched into classes PoolChunk and EntropySource to create
+# method stir() in each class.
+
+def stirFunction(self, entropy):
+	'''This function implements the entropy stirring algorithm.  It is monkey-patched
+	into classes PoolChunk and EntropySource as stirMethod(), so they can share its
+	implementation without copying code.
+
+	The stirring algorithm is as follows.  For each 32-byte subblock, B, of
+	entropy, compute the hash, H, of that subblock plus the next 31 subblocks (a
+	sliding window of 1024 bytes).  Then do B = B xor H.  Then advance to the next
+	subblock.
+	'''
+
+	# Create the hasher object.  We don't create a new hasher for trip through the
+	# outer loop, so that hasher.update() builds each hash on the previous input to
+	# the hasher plus the data passed to update().
+	hasher = hashlib.sha256()
+
+	# If self.entropy is zero bytes long, this is a zero-trip loop.
+	for subblockOffset in range(0, len(entropy), 32):
+		# Compute the hash, H.
+		hasher.update(entropy[subblockOffset:subblockOffset + 1024])
+		hash = hasher.digest()
+
+		# Set B = B xor H
+		for byteOffset in range(subblockOffset, subblockOffset + 32):
+			if byteOffset < len(self.entropy):
+				self.entropy[byteOffset] ^= hash[byteOffset % 32]
+
+################################################################################
+# Class Singleton.
+
+class Singleton:
+	'''This class is used to enforce the singleton pattern on subclasses.
+
+	A subclass's __init__ method should call this class's __init__ method with no
+	arguments (except self, of course).  If the subclass has been instantiated
+	already, an exception is raised to report the violation of the singleton pattern.
+	This class is thread-safe, so if multiple threads race to create the singleton,
+	only one wins.
+	'''
+
+	# Attribute _singletonExist belongs to this class and will always be False.  When
+	# a subclass calls Singleton.__init__, an attribute of the same name is set to True
+	# in the subclass, so that in the future we can know the subclass singleton exists.
+	_singletonExists = False
+
+	# Atrribute _singleton belongs to this class and is always None.  When a subclass
+	# calls Singleton.__init__, an attribute of the same name is set to self in the
+	# subclass, so that in the future we can retrieve the singleton object.
+	_singleton = None
+
+	lock = threading.Lock()
+
+	def __init__(self):
+		'''Raises an exception if another instance of this class has been instantiated,
+		otherwise marks the singleton instance of this class as having been instantiated.
+		'''
+
+		super().__init__()
+
+		with Singleton.lock:
+			if self.__class__._singletonExists:
+				raise Exception('Violation of singleton pattern!')
+
+			# Remember that the singleton exists.
+			self.__class__._singletonExists = True
+			self.__class__._singleton = self
+
+	def getSingleton(self):
+		'''Returns the singleton object (if it exists), otherwise None.'''
+		return self._singleton
+
+################################################################################
+# Class Mutex.
+
+class Mutex():
+	'''This class implements a system-wide interprocess mutex.  Yes, there is no such
+	thing in the Python standard library, so I had to roll my own.
+	'''
+
+	def __init__(self, name, retryInterval = 0.25, lockDir = '/tmp/python-mutexes'):
+		'''Mutex constructor.  Parameter "name" is the name of this mutex, which must not
+		contain the character "/".  Parameter "retryInterval" specifies the number of
+		seconds (which can be fractional) between retries to create the lock
+		directory when contending for the lock with another thread that already holds
+		the lock (default is 0.25 seconds).  Parameter "lockDir" specifies the parent
+		directory within which all of the individual mutex lock directories are
+		created (default is "/tmp/python-mutexes").
+		'''
+
+		super().__init__()
+
+		# The mutex name will be used to construct a pathname, so no '/'s allowed.
+		if '/' in name:
+			msg = 'Mutex {0} contains illegal character "/"!'.format(name)
+			log.error(msg)
+			raise Exception(msg)
+
+		self.name = name
+		self.retryInterval = retryInterval
+		self.lockDir = lockDir
+
+		# Make the parent lock-file directory if it doesn't exist.
+		try:
+			os.mkdir(self.lockDir, 0o700)
+
+		except OSError:
+			# Directory already exists, so ignore this exception.  All others keep
+			# going.
+			pass
+
+	def lock(self, timeout = 0):
+		'''Locks this mutex, waiting at most TIMEOUT seconds for the lock.  If
+		TIMEOUT is 0 (the default), waits forever for the lock.
+
+		Returns True if the lock was obtained, False if the timeout expired.
+		'''
+
+		self.startTime = time.time()
+		self.mutexDir = self.lockDir + '/' + self.name
+
+		while True:
+			try:
+				os.mkdir(self.mutexDir, 0o700)
+				return True  # Got the lock.
+
+			except OSError:
+				time.sleep(self.retryInterval)
+
+				if timeout != 0 and time.time() - self.startTime > timeout:
+					log.warning('Mutex "{0}" timed out waiting for lock!'.format(self.name))
+					return False
+
+				# Try to get the lock again.
+				continue
+
+	def release(self):
+		'''Releases this mutex.'''
+		os.rmdir(self.mutexDir)
+
+	def isLocked(self):
+		'''...'''
+		return os.path.isdir(self.mutexDir)
+
+	def __enter__(self):
+		'''Context manager support.'''
+		self.lock()
+		return self
+
+	def __exit__(self, extype, exval, extb):
+		'''Context manager support.'''
+		self.release()
+
+################################################################################
+# Class Pool.
+
+class EntropyPool(Singleton):
+	'''Represents an entropy pool.'''
+
+	def __init__(self):
+		super().__init__()
+
+		# There are initially zero bytes of entropy in the pool.
+		self.entropyByteCount = 0
+
+		# Create the deque to hold the PoolChunk objects.  It initially contains one
+		# empty PoolChunk object.
+		self.chunks = collections.deque()
+		self.chunks.append(PoolChunk())
+
+	def isFull(self):
+		'''Returns True if the pool is full, False otherwise.'''
+		assert self.entropyByteCount <= config['maxEntropy']
+		return self.entropyByteCount == config['maxEntropy']
+
+	def entropyCount(self):
+		'''Returns the number of bytes of entropy currently in the pool.'''
+		return self.entropyByteCount
+
+	def chunkCount(self):
+		'''Returns the number of EntropyChunk objects currently in the pool.'''
+		return len(self.chunks)
+
+	def addEntropy(self, entropy):
+		'''Adds the ENTROPY to the last PoolChunk in the pool.
+
+		If this would make the last PoolChunk contain more than
+		config['poolChunkMaxEntropy'] bytes of entropy, the excess bytes beyond
+		poolChunkLimit are put into a new PoolChunk object.
+
+		If this will make the pool contain more than config['maxEntropy'] bytes of
+		entropy, the excess bytes are ignored.
+
+		This method returns the number of bytes added to the pool.
+		'''
+
+		with Mutex('pool-mutex'):
+			totalBytesToAdd = min(len(entropy), config['maxEntropy'] - self.entropyByteCount)
+			remainingBytesToAdd = totalBytesToAdd
+
+			# Get the newest PoolChunk object.
+			chunk = self.chunks[-1]
+
+			while (remainingBytesToAdd > 0):
+				# Try to add the remaining entropy to the PoolChunk.
+				bytesAdded = chunk.addEntropy(entropy[totalBytesToAdd - remainingBytesToAdd:])
+
+				remainingBytesToAdd -= bytesAdded
+
+				log.debug('Added {0} bytes to chunk #{1}, remainingBytesToAdd = {2}'
+						  .format(bytesAdded, chunk.id, remainingBytesToAdd))
+
+				if (remainingBytesToAdd > 0):
+					# This chunk is full, and we have leftover entropy still to save.
+					# Create a new PoolChunk and keep going.
+					chunk = PoolChunk()
+					self.chunks.append(chunk)
+					log.debug('New chunk added (id {0}): total chunks = {1}'
+							  .format(chunk.id, len(self.chunks)))
+
+			# Count what we just added to the pool.
+			self.entropyByteCount += totalBytesToAdd
+
+			# This will be non-zero if the pool exceeds config['maxEntropy'].
+			bytesNotAdded = len(entropy) - totalBytesToAdd
+
+			if bytesNotAdded > 0:
+				log.warning('THE POOL IS FULL (maxEntropy = {0}): {1} bytes not added to pool!'
+							.format(config['maxEntropy'], bytesNotAdded))
+
+			# Return the number of bytes of entropy added to the pool.
+			return totalBytesToAdd
+
+	def persist(self):
+		'''This method persists the entropy pool (this object) to the file specified by
+		configuration parameter "persistFile".  Returns True if successful, False
+		otherwise.
+		'''
+
+		try:
+			with Mutex('pool-mutex'):
+				filename = config['persistFile']
+				persistedData = pickle.dumps(self, pickle.HIGHEST_PROTOCOL)
+
+				if havelzma:
+					persistedDate = bytearray(lzma.compress(persistedData, lzma.FORMAT_RAW, lzma.CHECK_NONE,
+															filters = [dict(id = lzma.FILTER_LZMA2,
+																			preset = 6)]))
+				else:
+					persistedData = bz2.compress(persistedData, compresslevel = 9)
+
+				with open(filename, 'wb') as file:
+					file.write(persistedData)
+					log.info('Persisted the entropy pool to file {0} (size = {1} bytes)'
+							 .format(filename, os.path.getsize(filename)))
+					return True
+
+		except:
+			log.exception('Exception while persisting the entropy pool to file {0}:'.format(filename))
+			return False
+
+		finally:
+			persistedData = None
+
+	def getEntropy(self):
+		'''...'''
+		# UNDER CONSTRUCTION
+		pass
+
+################################################################################
+# Class PoolChunk.
+
+class PoolChunk:
+	'''Represents up to config['poolChunkMaxEntropy'] bytes of entropy within a Pool.
+	See class Pool.
+	'''
+
+	stirMethod = stirFunction
+	nextChunkID = 0
+
+	def __init__(self):
+		super().__init__()
+
+		# Each PoolChunk instance has a monotonically increasing integer ID.
+		self.id = PoolChunk.nextChunkID
+		PoolChunk.nextChunkID += 1
+
+		# Create the initially empty bytearray to hold the entropy.
+		self.entropy = bytearray()
+
+	def addEntropy(self, newEntropy):
+		'''Adds the bytes from ENTROPYBYTES to the bytearray.  ENTROPYBYTES is assumed to
+		already have been compressed and stirred.  If adding ENTROPYBYTES to this
+		PoolChunk would cause it to exceed the maximum chunk size (configuration
+		parameter poolChunkMaxEntropy), only as many bytes as needed to reach the
+		maximum will be accepted.
+
+		Returns the number of bytes of entropy added to the chunk.
+		'''
+
+		chunkMax = config['poolChunkMaxEntropy']
+
+		if len(self.entropy) >= chunkMax:
+			# This chunk is full.
+			return 0
+
+		# Only accept as much entropy to fill this chunk to the max.
+		spaceLeft = chunkMax - len(self.entropy)
+
+		if len(newEntropy) > spaceLeft:
+			bytesToAdd = spaceLeft  # newEntropy is too big.
+		else:
+			bytesToAdd = len(newEntropy)  # newEntropy will fit.
+
+		self.entropy = self.entropy + newEntropy[0:bytesToAdd]
+
+		# Stir the entropy in this cunk.
+		self.stir()
+
+		# Return the number of bytes we added this chunk.
+		return bytesToAdd
+
+	def stir(self):
+		'''Stirs the entropy in this PoolChunk.  See function stirFunction for the stirring
+		algorithm.
+		'''
+
+		self.stirMethod(self.entropy)
+		return True
+
+	def getEntropy(self):
+		'''Returns a bytearray containing the entropy in this PoolChunk.'''
+		return self.entropy
+
+################################################################################
+# Class EntropySource.
+
+class EntropySource:
+	'''This class represents an entropy source as configured by the EGD configuration
+	file.  This class holds a dictionary defining the entropy source and overloads
+	__getitem__ to allow lookups in that dictionary.  This class implements the
+	entropy source fetching for each source, the compression and stirring
+	of the resulting data, and adding it to the entropy pool.
+	'''
+
+	stirMethod = stirFunction
+
+	def __init__(self, sourceDict):
+		# Set the scale factor to 1.0 if none was given in the entropy source
+		# definition.
+		if not 'scale' in sourceDict:
+			sourceDict['scale'] = 1.0
+
+		# Validate mandatory keys in sourceDict.
+		for key in ('name', 'interval'):
+			if not key in sourceDict:
+				msg = 'Entropy source created with missing mandatory key {0}!'.format(key)
+				log.error(msg)
+				raise Exception(msg)
+
+		# Exactly one of several mutually exclusive keys must be a key in sourceDict.
+		exclusiveKeys = { 'url', 'urlfunction', 'file', 'cmd', 'function' }
+		sourceDictKeySet = set(sourceDict.keys())
+
+		if len(sourceDictKeySet & exclusiveKeys) != 1:
+			msg = 'Entropy source {0} created with missing mandatory key from set {1}!'
+			msg = msg.format(sourceDict['name'], str(exclusiveKeys))
+			log.error(msg)
+			raise Exception(msg)
+
+		self.sourceDict = sourceDict
+		self.entropy = bytearray()
+		self.fetched = self.compressed = self.stirred = False
+		self.failCount = 0
+		self.disabled = False
+		self.firstFetchTime = 0
+		self.lastFetchTime = 0
+		self.lastEntropySubset = b''
+
+	def __getitem__(self, key):
+		'''Overloads operator [] for this class.  For an entropy source, e, Use e["key"] to
+		access the dictionary items that define the entropy source (see ~/.egdconf for
+		documentation of the keys).
+		'''
+		if not key in self.sourceDict:
+			raise KeyError('Key "{0}" not found in EntropySource "{1}"!'.format(key, self.sourceDict['name']))
+
+		return self.sourceDict[key]
+
+	def fetchUrl(self, useUrlFunction = False):
+		'''Fetches entropy by reading it from the URL associated with key 'url' or the URL
+		returned by the function associated with key 'urlfunction' in
+		self.sourceDict.
+		'''
+
+		if useUrlFunction:
+			url = self['urlfunction']()
+		else:
+			url = self['url']
+
+		if url == '':
+			log.error('URL is the empty string for source "{0}"!  Skipping source.'.format(self['name']))
+			return False
+
+		bytesToRead = 0
+
+		if 'size' in self.sourceDict:
+			bytesToRead = self['size']
+
+		try:
+			# Maybe prefetch another URL first ...
+			if 'prefetch' in self.sourceDict:
+				httpResponse = urllib.request.urlopen(self['prefetch'])
+				data = httpResponse.read()
+				time.sleep(1)
+				data = None
+
+			httpResponse = urllib.request.urlopen(url)
+
+			if bytesToRead == 0:
+				self.entropy = bytearray(httpResponse.read())
+			else:
+				self.entropy = bytearray(httpResponse.read(bytesToRead))
+		except:
+			log.exception('Exception fetching URL "{0}":'.format(url))
+			self.entropy = bytearray()
+			return False
+
+		return True
+
+	def fetchFile(self):
+		'''Fetches entropy by reading it from the filename associated with key 'file' in
+		self.sourceDict.
+		'''
+
+		fileName = self['file']
+		if not os.path.exists(fileName):
+			log.error('File not found "{0}"!'.format(fileName))
+			return False
+
+		# Find out how many bytes to read from the file.
+		if 'size' in self.sourceDict:
+			bytesToRead = self['size']
+		else:
+			bytesToRead = os.path.getsize(fileName)
+
+		try:
+			with open(fileName, 'rb') as file:
+				self.entropy = bytearray(file.read(bytesToRead))
+		except:
+			log.exception('Exception reading file "{0}":'.format(fileName))
+			self.entropy = bytearray()
+			return False
+
+		return True
+
+	def fetchCmd(self):
+		'''Fetches entropy by executing the command associated with key 'cmd' in self.sourceDict.'''
+
+		programAndArgs = self['cmd']
+
+		try:
+			self.entropy = bytearray(subprocess.check_output(programAndArgs, universal_newlines = False,
+															 stderr = subprocess.DEVNULL, timeout = 30))
+		except:
+			log.exception('Exception executing command "{0}":'.format(' '.join(programAndArgs)))
+			self.entropy = bytearray()
+			return False
+
+		return True
+
+	def fetchFunction(self):
+		'''Fetches entropy by calling the function object associated with key 'function'
+		in self.sourceDict.
+		'''
+		
+		# The data is obtained by calling the function with no arguments.
+		function = self['function']
+
+		try:
+			self.entropy = function()
+		except:
+			log.exception('Exception calling function "{0}":'.format(function.__name__))
+			self.entropy = bytearray()
+			return False
+
+		return True
+
+	def fetch(self):
+		'''Fetches the data for this entropy source.  Returns True if successful, False
+		otherwise.
+		'''
+
+		# Disable this entropy source if self.failCount gets too high.
+		if self.failCount > 5:
+			log.warning('Failure count for entropy source {0} is {1}.  Disabling this source!'
+						.format(self.failCount, self['name']))
+			self.disabled = True
+
+		# Mark this entropy source as not yet having been fetched.
+		self.fetched = False
+
+		# Check that this source is scheduled to do a fetch.
+		interval = self['interval']
+		now = time.time()
+
+		# If this is the first fetch of this source, record when it happened.
+		if self.firstFetchTime == 0:
+			self.firstFetchTime = now
+
+		# Delay the first fetch of this source if key 'initdelay' exists.
+		if 'initdelay' in self.sourceDict and now - self.firstFetchTime < self['initdelay']:
+			log.debug('Delaying initial fetch of "{0}" for {1} seconds'
+					  .format(self['name'], self['initdelay'] - (now - self.firstFetchTime)))
+			return False
+
+		# Skip this fetch of this source if the fetch interval has not yet passed.
+		if now - self.lastFetchTime < interval:
+			log.debug('Skipping fetch of "{0}": interval {1} seconds not yet passed'
+					  .format(self['name'], interval))
+			return False
+
+		# Update the last fetch time here, so that we don't retry one minute after
+		# one of the below fetchXxx functions fails for any reason.
+		self.lastFetchTime = time.time()
+
+		if 'url' in self.sourceDict:
+			status = self.fetchUrl()
+		elif 'urlfunction' in self.sourceDict:
+			status = self.fetchUrl(useUrlFunction = True)
+		elif 'file' in self.sourceDict:
+			status = self.fetchFile()
+		elif 'cmd' in self.sourceDict:
+			status = self.fetchCmd()
+		elif 'function' in self.sourceDict:
+			status = self.fetchFunction()
+		else:
+			self.failCount += 1
+			log.error('Entropy source "{0" has no url/urlfunction/file/cmd/function key! Skipping!')
+			return False
+
+		# If the fetch helper failed, return False.
+		if status != True:
+			self.failCount += 1
+			log.warning('Fetch of "{0}" failed!'.format(self['name']))
+			return False
+
+		if len(self.entropy) == 0:
+			self.failCount += 1
+			log.warning('Fetch of "{0}" returned 0 bytes of data!'.format(self['name']))
+			return False
+
+		if 'minsize' in self.sourceDict and len(self.entropy) < self['minsize']:
+			log.warning('Fetch of "{0}" returned below minimum ({1} bytes) of data!  Ignoring it.'
+						.format(self['name'], self['minsize']))
+			self.entropy = bytearray()  # Lose the reference to the entropy.
+			return False
+
+		log.debug('Fetched {0} bytes from entropy source "{1}"'.format(len(self.entropy), self['name']))
+
+		# If the first and last 4096 bytes of the entropy just fetched from this source is the
+		# same as from the last fetch, ignore it.
+		entropySubset = self.entropy[0:4096] + self.entropy[-4096:]
+
+		if entropySubset == self.lastEntropySubset:
+			log.warning('Entropy appears the same as from last fetch!  Ignoring it.')
+			self.entropy = bytearray()  # Lose the reference to the duplicate entropy.
+			return False
+
+		# Save the current entropy subset for the next fetch check.
+		self.lastEntropySubset = entropySubset
+
+		# Mark this entropy source as having been fetched.
+		self.fetched = True
+
+		# Compress and stir the fetched data.
+		self.compress()
+
+		# Stir the data.
+		self.stir()
+
+		return True
+
+	def compress(self):
+		'''Compresses and stirs the data after it has been fetched.  Returns True if
+		successful, False otherwise.
+		'''
+
+		if not self.fetched:
+			log.error('Attempt to compress unfetched data!')
+			return False
+
+		if not 'nocompress' in self.sourceDict:
+			# Compress the entropy.
+			if havelzma:
+				self.entropy = bytearray(lzma.compress(self.entropy, lzma.FORMAT_RAW, lzma.CHECK_NONE,
+													   filters = [dict(id = lzma.FILTER_LZMA2, preset = 6)]))
+			else:
+				self.entropy = bytearray(bz2.compress(self.entropy, compresslevel = 9))
+
+
+		# Mark this entropy source as having been compressed.  We do this even if
+		# we're skipping copression so as to make method entropy() happy.
+		self.compressed = True
+		return True
+
+	def stir(self):
+		if not self.compressed:
+			log.error('Attempt to stir uncompressed data in source "{0}"!'.format(self['name']))
+			return False
+
+		self.stirMethod(self.entropy)
+
+		# Mark this entropy source as having been stirred.
+		self.stirred = True
+
+
+	def getEntropy(self):
+		'''Returns the data fetched (compressed and stirred) by this entropy source.  If
+		fetching, compression, o stirring have not yet been applied, returns an empty
+		bytes object.
+		'''
+
+		if not self.stirred:
+			msg = 'EntropySource.data: Attempt to retrieve unstirred entropy in class EntropySource!'
+			log.error(msg)
+			return bytearray()
+
+		# Return the entropy data scaled by the scale factor.
+		scaledBytes = round(len(self.entropy) * self.sourceDict['scale'])
+		log.debug('Returning {0} bytes of entropy scaled down from {1} bytes for source "{2}"'
+				  .format(scaledBytes, len(self.entropy), self['name']))
+
+		return self.entropy[0:scaledBytes]
+
+################################################################################
+# Class Config.
+
+class Config(Singleton):
+	'''This class implements the configuration file processing.  Pass the constructor
+	the pathname of the config file, then call method getConfig() to obtain a dictionary
+	of configuration parameters and entropy sources.
+	'''
+
+	def __init__(self, configFile):
+		self.configDict = {}
+
+		if not os.path.isfile(configFile):
+			raise Exception('File not found: {0}'.format(configFile))
+
+		# Execute the configuration file as Python code.  Variable assignments in
+		# the file become key/value pairs in self.configDict.
+		try:
+			with open(configFile, 'r') as file:
+				configFileData = file.read()
+
+			# Execute the config file code.  Global variables in this script cannot
+			# be assigned/accessed by the config file code, because we pass an empty
+			# dictionary as the second parameter to exec().  It will capture any global
+			# variable assignments made by the config file code.
+			exec(configFileData, { 'log': log }, self.configDict)
+	
+		except:
+			# Something went wrong.
+			log.exception('Exception reading config file ({0}):'.format(configFile))
+			raise
+
+	def getConfig(self):
+		return self.configDict
+
+################################################################################
+# Class TCPRequestHandler.
+
+class TCPRequestHandler(socketserver.BaseRequestHandler):
+	'''UNDER CONSTRUCTION.  This is instantiated once per connection to the server, and
+    must override the handle() method to implement communication to the client.
+	'''
+
+	@classmethod
+	def setDaemon(cls, daemon):
+		cls.daemon = daemon
+
+	def handle(self):
+		'''This is the server handler method required by BaseRequestHandler.  It is
+		responsible for implement the TCP I/O.'''
+
+		try:
+			# self.request is the TCP socket connected to the client.
+			request = self.request.recv(1024).decode().strip()
+			log.info('Received request from {0}: "{1}"'.format(self.client_address[0], request))
+		except:
+			log.exception('Exception while receiving TCP request:')
+			return
+
+		# Process the request
+		try:
+			# Response codes:
+			#
+			# 100 => Success
+			# 200 => Unrecognized request
+			# 300 => Failed to persist pool
+
+			if request == 'quit':
+				TCPRequestHandler.daemon.daemonTerminateEvent.set()
+				response = b'100 OK\n'
+
+			elif request == 'status':
+				data = 'Pool has {0} bytes of entropy in {1} PoolChunks.'.format(pool.entropyCount(),
+																				 len(pool.chunks))
+				response = b'100 OK\n' + data.encode()
+
+			elif request == 'persist':
+				if pool.persist():
+					response = b'100 OK\n'
+				else:
+					response = b'300 Failed to persist pool!\n'
+
+			else:
+				response = b'200 Unrecognized request\n' + request
+
+		except:
+			log.exception('Exception while setting daemonTerminateEvent:')
+			return
+
+		# Send the response.
+		try:
+			self.request.sendall(response)
+			log.info('Sent response "{0}"'.format(response.decode().strip()))
+		except:
+			log.exception('Exception while sending TCP response for request "{0}":'.format(request))
+
+################################################################################
+# Class EGDServer.
+
+class EGDServer(Singleton):
+	'''This class implements the TCP server thread in the EGD daemon.'''
+
+	def __init__(self, daemon):
+		Singleton.__init__(self)
+		self.port = config['tcpPort']
+		self.daemon = daemon
+
+	def tcpServerThreadFunc(self):
+		'''This is the TCP server thread function.'''
+
+		log.debug('TCP server thread function entered: binding TCP server socket ...')
+
+		# Store the daemon object reference in TCPRequestHandler so that method
+		# handle() can access it.
+		TCPRequestHandler.setDaemon(self.daemon)
+
+		# Create the server, binding to port config['tcpPort'] on localhost.
+		try:
+			self.server = socketserver.TCPServer(('localhost', config['tcpPort']), TCPRequestHandler)
+		except:
+			log.exception('Exception binding to localhost port {0} in socketserver.TCPServer:'
+						  .format(config['tcpPort']))
+			return
+
+		try:
+			self.server.serve_forever()
+		except:
+			log.exception('Exception in server.serve_forever:')
+
+		log.info('TCP server thread terminating!')
+
+	def start(self):
+		'''Starts the TCP server thread.'''
+
+		self.thread = threading.Thread(target = self.tcpServerThreadFunc, name = "TCP Server Thread")
+		self.thread.start()
+		log.info('Started TCP server thread')
+
+	def stop(self):
+		'''Stops the TCP server thread.'''
+
+		# Command the thread to stop.
+		self.server.shutdown()		
+
+		# Wait for it to stop.
+		self.thread.join()
+		log.info('Stopped the TCP server thread')
+
+################################################################################
+# Class Daemon.
+
+class Daemon(Singleton):
+	'''This class implements the daemon side of the EGD.'''
+
+	def __init__(self):
+		super().__init__()
+
+		self.entropySources = []
+		self.daemonTerminateEvent = threading.Event()
+		self.lockFile = ''
+		self.lastPersistTime = 0
+
+	def createLockFile(self):
+		if os.name == 'posix':
+			self.lockFile = '/tmp/egd.lck'
+		elif os.name == 'nt':
+			self.lockFile = r'/cygdrive/c/temp/egd.lck'
+		else:
+			log.error('Unknown OS type ({0}): no lockfile created!'.format(os.name))
+			return False
+
+		log.debug('lockFile = "{0}"'.format(self.lockFile))
+
+		# Exclusive mode (x) is not supported until Python 3.4!
+		version = float('{0}.{1}'.format(sys.version_info.major, sys.version_info.minor))
+
+		if version >= 3.4:
+			if options['--force']:
+				mode = 'w'
+			else:
+				mode = 'x'  # Exclusive creation: fails if file exists.
+
+			try:
+				with open(self.lockFile, mode) as file:
+					file.write('EGD running: PID {0}\n'.format(os.getpid()))
+					return True
+			except FileExistsError:
+				log.error('Lock file ({0}) exists: not starting daemon!'.format(self.lockFile))
+				return False
+
+			except:
+				log.exception('Exception creating lock file ({0}):'.format(self.lockFile))
+				return False
+
+		else:
+			# Pre-3.4 Python: no 'x' open mode and no FileExistsException.
+			if options['--force']:
+				flags = os.O_WRONLY | os.O_CREAT
+			else:
+				flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+
+			try:
+				fd = os.open(self.lockFile, flags)
+				with os.fdopen(fd, mode = 'w') as file:
+					file.write('EGD running: PID {0}\n'.format(os.getpid()))
+				return True
+
+			except OSError:
+				log.error('Lock file ({0}) exists: not starting daemon!'.format(self.lockFile))
+				return False
+
+			except:
+				log.exception('Exception creating lock file ({0}):'.format(self.lockFile))
+				return False
+
+	def detachFromTerminal(self):
+		'''Makes this process a daemon by detaching from the terminal.'''
+		try:
+			pid = os.fork()
+
+			if (pid == 0):  # The first child.
+				os.setsid()
+				pid = os.fork()
+
+				if (pid == 0):  # The second child.
+					# Close stdin, stdout, and stderr (but leave the log file file descriptor open).
+					for fd in (0, 1, 2):
+						try:
+							os.close(fd)
+						except OSError:
+							pass
+
+					os.chdir('/')
+					os.umask(0o022)
+
+				else:
+					os._exit(0)  # Exit parent (the first child) of the second child.
+
+			else:
+				os._exit(0)  # Exit parent of the first child.
+
+		except:
+			log.exception('Exception while detaching from terminal:')
+
+	def daemonMainLoop(self):
+		'''This is the main loop of the daemon process.  It periodically iterates over the
+		list of EntropySource objects, telling each to fetch data from its configured
+		source.  If the fetch succeeds, the gathered entropy is added to the pool.
+		'''
+
+		while True:
+			log.debug('-' * 50)
+
+			entropyAdded = 0
+			totalEntropyAdded = 0
+
+			for source in self.entropySources:
+				if not source.disabled and not pool.isFull():
+					# Fetch the entropy for source.  This also compresses and stirs the entropy.
+					# If source.fetch() fails, we don't need to log anything, because it did the
+					# logging for us.
+					if source.fetch():
+						# Add the entropy to the pool.  Method entropy() applies the scaling
+						# factor from the entropy source object.
+						entropy = source.getEntropy()
+
+						if len(entropy) > 0:
+							entropyAdded = pool.addEntropy(entropy)
+							totalEntropyAdded += entropyAdded
+
+							log.info('Added {0:5} bytes of entropy (total {1:6} bytes in {2:3} chunks) from source "{3}"'.
+									 format(entropyAdded, pool.entropyCount(), pool.chunkCount(),
+											source['name']))
+						else:
+							log.error('Got zero length entropy from entropy source {0}'
+									  .format(source['name']))
+
+			# Report the updated pool entropy
+			if totalEntropyAdded > 0:
+				log.info('Pool has {0} bytes of entropy in {1} PoolChunks ({2:.2f}% full)'
+						 .format(pool.entropyCount(), len(pool.chunks),
+								 pool.entropyCount()/config['maxEntropy'] * 100))
+				log.info('-' * 50)
+
+				# Maybe persist the entropy pool to disk.  Only do this if a non-zero
+				# amount of entropy was just added to the pool.
+				now = time.time()
+
+				if now - self.lastPersistTime > config['persistInterval'] and pool.persist():
+					# Only update lastPersistTime if pool.persist() returns True.
+					self.lastPersistTime = now
+
+			# Sleep for one minute or until commanded to terminate by the TCP server
+			# thread setting this event.
+			if self.daemonTerminateEvent.wait(60):
+				# The terminate event was set.  Cleanup and exit.
+
+				# Stop the TCP Server thread.
+				self.tcpServer.stop()
+
+				# Persist the entropy pool.  Ignore return status, because we're
+				# terminating the daemon.
+				pool.persist()
+
+				return 0
+
+	def run(self):
+		'''This function implments the EGD daemon.  Returns an integer exit status to be
+		returned from this script.
+		'''
+
+		try:
+			status = 0
+
+			# If the daemon is already running, refuse to start.
+			if not self.createLockFile():
+				# No need to log anything, because createLockFile already did.
+				status = 1
+				return status
+
+			# Start the TCP server.
+			self.tcpServer = EGDServer(self)
+			self.tcpServer.start()
+
+			# Detach from terminal and become a daemon, but only under UNIX/Cygwin.  Python3
+			# can't do this on Windows.  Use pythonw.exe to run the daemon on Windows without
+			# showing a Command Prompt window.
+			if os.name == 'posix':
+				self.detachFromTerminal()
+
+			# Enable the entropy sources from the configuration file.  A key that starts
+			# with "source" has a value that is a dictionary defining an entropy source.
+			for key, value in config.items():
+				if key[0:6] == 'source':
+					self.entropySources.append(EntropySource(value))
+
+				elif key[0:15] == 'disabled_source':
+					# Ignore disabled entropy sources.
+					log.info('Disabled entropy source: "{0}" (interval {1} seconds)'
+							 .format(value['name'], value['interval']))
+
+			# Create the global entropy pool.
+			global pool
+
+			# De-persist it from the persistent store on disk, if it exists.
+			persistFilename = config['persistFile']
+
+			if os.path.isfile(persistFilename):
+				try:
+					with open(persistFilename, 'rb') as file:
+						persistedData = file.read()
+						if havelzma:
+							persistedData = lzma.decompress(persistedData)
+						else:
+							persistedData = bz2.decompress(persistedData)
+
+					pool = pickle.loads(persistedData)
+
+					log.info('De-persisted entropy pool from disk: {0} bytes of entropy in pool'
+							 .format(pool.entropyCount()))
+
+				except:
+					log.exception('Exception while de-persisting the entropy pool from file {0}:'
+								  .format(persistFilename))
+					pool = EntropyPool()
+
+				finally:
+					persistedData = None
+
+			else:
+				# No perssistent store on disk, so start with an empty pool.
+				pool = EntropyPool()
+
+			# Enter the main loop of the daemon.
+			status = self.daemonMainLoop()
+			return status
+
+		finally:
+			# Delete the lock file.
+			try:
+				log.debug('Deleting lock file "{0}"'.format(self.lockFile))
+				if self.lockFile != '':
+					os.remove(self.lockFile)
+			except:
+				log.exception('Exception when removing lock file ({0}):\n{1}'.format(self.lockFile))
+
+			log.info('Daemon terminating with status {0}!'.format(status))
+
+################################################################################
+# Functions to implement the command-line interface.  If this file is loaded as a
+# module, the client can use these functions to do everything that the command-line
+# interface can do.
+
+def usage():
+	'''Displays usage for the command-line interface.'''
+
+	# Indent lines with TABs which will be removed before displaying this string.
+	# Don't use TABs anywhere within the text.
+	usage = '''usage: {0} {{ --start [ --force ] | --stop | --status | --persist | --getentropy N }}
+
+			--start    	  =>  Starts the daemon (if it's not already running).
+			--force    	  =>  Start the daemon even if the lock file exists.
+			--stop     	  =>  Stops the daemon.
+			--status   	  =>  Shows the status of the EGD daemon with entropy stats.
+			--persist  	  =>  Persists the entropy pool to disk.
+			--getentropy  =>  Outputs N bytes of entropy in binary to stdout.  If not
+			                  enough entropy is available, outputs fewer than N bytes.
+			'''
+	print(usage.replace('\t', '').format(os.path.basename(sys.argv[0])), file = sys.stderr)
+	sys.exit(1)
+
+def processConfigFile(isdaemon = False):
+	'''This function processes the configuration file, filling in the global dictionary
+	config with configuration parameters.
+	'''
+
+	# Read the configuration file (~/.egdconf).
+	configFile = os.environ['HOME'] + r'/.egdconf'
+
+	# Global variable config holds a dictionary of configuration parameters and
+	# their values.
+	global config
+	config = Config(configFile).getConfig()
+
+	# Process configuration parameters.
+	for key, value in sorted(config.items()):
+		if key[0:6] == 'source' and isdaemon:
+			# Define an entropy source.
+			log.debug('Enabled entropy source: "{0}" (interval {1} seconds)'
+					  .format(value['name'], value['interval']))
+
+		elif key[0:15] == 'disabled_source' and isdaemon:
+			# Ignore disabled entropy sources.
+			log.info('Disabled entropy source: "{0}" (interval {1} seconds)'
+					 .format(value['name'], value['interval']))
+
+		elif isdaemon:
+			log.debug('Parameter: {0} = {1}'.format(key, value))
+
+		# If parameter logLevel was specified in the config file, override the
+		# default log level (INFO) with its value.
+		if key == 'logLevel':
+			logging.getLogger().setLevel(value)
+			if isdaemon:
+				log.info('Log level overridden by config file: now set to {0}'.format(value))
+
+	# If some configuration parameters are missing, use hardcoded default values.
+	defaultParams = dict(maxEntropy = 10 * 1024 * 1024,  # 10 MB
+						 persistFile = os.environ['HOME'] + r'/.egdentropy',
+						 persistInterval = 600,
+						 poolChunkMaxEntropy = 8192,
+						 tcpPort = 2121)
+
+	for param in defaultParams.keys():
+		if not param in config:
+			if isdaemon:
+				log.info('Configuration parameter "{0}" not specified: using hardcoded default value!'
+						 .format(param))
+			config[param] = defaultParams[param]
+
+def configureLogging():
+	'''Configures logging for this module.'''
+
+	if 'EGD_NO_LOGGING' in os.environ:
+		logLevel = 999999
+	else:
+		logLevel = logging.INFO
+
+	logfile = r'/cygdrive/c/franl/.egd.log'
+
+	# If parameter logLevel is specified in the config file, function
+	# processConfigFile will override the default logging level defined here.
+	logging.basicConfig(filename = logfile, filemode = 'a',
+						format = '%(asctime)s: %(levelname)s %(funcName)s %(lineno)s: %(message)s',
+						level = logLevel)
+
+	global log
+	log = logging  # Save some typing.
+
+def sendDaemonCommand(command):
+	'''This function sends a command to the daemon (appending a newline to command) and
+	returns a tuple, (STATUS-CODE, STATUS-TEXT, OPTIONAL-DATA), where STATUS-CODE is
+	the numeric status code returned by the daemon, STATUS-TEXT is the textual
+	representation of STATUS-CODE, and OPTIONAL-DATA is optional additional data sent
+	with the response (e.g., an error message or the requested data).
+
+	If we failed to communicate with the daemon, STATUS-CODE is 0, STATUS-TEXT is an
+	informative message, and OPTIONAL-DATA contains a stack backtrace (if an
+	exception occurred).
+	'''
+
+	log.debug('Sending command "{0}" to daemon'.format(command))
+
+	host, port = 'localhost', config['tcpPort']
+
+	# Create a socket (SOCK_STREAM means a TCP socket).
+	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+	try:
+		# Connect to server and send data.
+		sock.connect((host, port))
+		sock.sendall(command)
+
+		# Receive data from the server and close the socket.
+		# TODO: Improve this logic to handle large responses (e.g., entropy).
+		# UNDER CONSTRUCTION
+		response = sock.recv(1024)
+
+	except:
+		log.exception('Exception communicating with daemon:')
+		return (0, b'Exception while communicating with daemon!', bytearray(traceback.format_exc(), 'utf-8'))
+
+	finally:
+		sock.close()
+
+	log.debug('Daemon ressponse = "{0}"'.format(response))
+
+	# response has the form "STATUSCODE STATUSTEXT\nOPT-DATA", where STATUSCODE is always
+	# 3 digits followed by one space, STATUSTEXT is the textual representation of
+	# STATUSCODE, and OPT-DATA is optional additional data.
+	status, sep, data = response.partition(b'\n')
+	statuscode = int(status[0:3])
+	statustext = status[4:]
+
+	return (statuscode, statustext, data)
+
+def startDaemon():
+	'''This function starts the EGD daemon in the background by re-launching this script
+	with the hidden --daemon option.  Function commandLineInterface calls this
+	function to implement the --start option.
+
+	Returns the empty string if successful, otherwise a string containing error message.
+	'''
+
+	# Background the daemon differently on Windows and UNIX/Cygwin (os.name is
+	# 'posix' on Cygwin).  os.spawnl() crashes Python 3.4.2 on Windows.
+	if os.name == 'posix':
+		if options['--force']:
+			os.spawnl(os.P_NOWAIT, sys.argv[0], sys.argv[0], '--daemon', '--force')
+		else:
+			os.spawnl(os.P_NOWAIT, sys.argv[0], sys.argv[0], '--daemon')
+
+		log.info('Daemon started')
+		return ''
+
+	elif os.name == 'nt':
+		cmd = r'start c:\apps\python32\pythonw.exe ' + sys.argv[0] + ' --daemon' + \
+			  (options['--force'] and ' --force' or '')
+		os.system(cmd)
+		log.info('Daemon started with command: {0}'.format(cmd))
+		return ''
+
+	else:
+		msg = 'Unsupported OS ({1}): daemon not started!'.format(os.path.basename(os.name))
+		log.error(msg)
+		return msg
+
+def stopDaemon():
+	'''This function gracefully stops the EGD daemon.  Function commandLineInterface calls
+	this function to implement the --stop option.
+
+	Returns the empty string if successful, otherwise a string containing error message.
+	'''
+
+	status, text, data = sendDaemonCommand(b'quit')
+
+	if status != 100:
+		msg = 'Error stopping daemon: status = {0} ({1}), data = "{2}"!'.format(status, text, data)
+		log.error(msg)
+		return msg
+
+	return ''
+
+def getDaemonStatus():
+	'''This function queries the daemon for its status.  Function commandLineInterface
+	calls this function to implement the --status option.
+
+	Returns the status of the daemon as a string.
+	'''
+
+	status, text, data = sendDaemonCommand(b'status')
+
+	if status == 100:
+		return data.decode()
+
+	if status == 0:
+		msg = 'Error communicating with daemon!  It may not be running.'
+	else:
+		msg = 'Error querying daemon status: status = {0} ({1}), data = "{2}"!'.format(status, text, data)
+
+	log.error(msg)
+	return msg
+
+def getEntropySources():
+	'''This function returns a list of dictionaries, each defining an entropy source.
+	Function commandLineInterface calls this function to implement the --sources
+	option.
+	'''
+	retval = []
+	for key, value in config.items():
+		if key[0:6] == 'source':
+			retval.append(value)
+	return retval
+
+def getEntropy(countBytes):
+	'''This function returns up to COUNTBYTES of entropy from the pool as a bytes object.
+	If there is not enough entropy in the pool, fewer bytes are returned.  Function
+	commandLineInterface calls this function to implement the --getentropy option.
+	'''
+	# UNDER CONSTRUCTION
+	pass
+
+def persistPool():
+	'''...'''
+
+	status, text, data = sendDaemonCommand(b'persist')
+
+	if status == 100:
+		return ''
+
+	if status == 0:
+		msg = 'Error communicating with daemon!  It may not be running.'
+	else:
+		msg = 'Error persisting pool: status = {0} ({1}), data = "{2}"!'.format(status, text, data)
+
+	log.error(msg)
+	return msg
+
+def parseCommandLine():
+	'''Parses the command line, setting the values in dictionary "options" to True or
+	False depending on whether the coresponding option was given.  Also checks for
+	invalid or incompatible options, displaying usage and terminating in that those
+	cases.
+	'''
+
+	# Parse the command line, setting values in dictionary 'options' to True as we find
+	# corresonding command-line options.
+	if len(sys.argv) == 1:
+		# No arguments given.
+		log.error('No arguments given: terminating!')
+		usage()
+
+	# Reset all command-line option flags to False.
+	global options
+	options = { option: False for option in ('--start', '--stop', '--status', '--force', '--sources',
+											 '--save', '--daemon', '--persist') }
+
+	for arg in sys.argv[1:]:
+		for option in options.keys():
+			if arg == option:
+				options[option] = True
+				break
+		else:
+			# Unrecognized option.
+			log.error('Unrecognized option: "{0}": terminating!'.format(arg))
+			print('Unrecognized option: "{0}"!\n'.format(arg), file = sys.stderr)
+			usage()
+
+	# Check for incompatible options.
+	incompatibles = (('--start', '--stop', '--sources', '--persist', '--status'),
+					 ('--force', '--stop', '--sources', '--persist', '--status'),
+					 ('--daemon', '--start', '--stop', '--sources', '--persist', '--status'))
+
+	for incompatible in incompatibles:
+		if list(map(lambda x: options[x], incompatible)).count(True) > 1:
+			incompats = [x for x in options.keys() if options[x] == True]
+			log.error('Incompatible command-line options used: {0}.  Terminating!'
+					  .format(', '.join(incompats)))
+			usage()
+
+def commandLineInterface():
+	'''This function implements the command-line interface to EGD, parsing the
+	command-line (from sys.argv), taking appropriate actions, and outputing results
+	to the terminal.  Returns an integer exit status, which this script will return
+	to the shell.
+
+	NOTE: Because function startDaemon spawns this script in a new process to create
+	the daemon, this function runs for both interactive usage and for the daemon.
+	Output is only visible for interactive usage.
+	'''
+
+	# Configure logging.
+	configureLogging()
+
+	log.info('=' * 80)
+	log.info('EGD started (PID {0}) with argv = "{1}"'.format(os.getpid(), '", "'.join(sys.argv)))
+
+	# This will terminate this process if usage is displayed.
+	parseCommandLine()
+
+	# Process the config file.  Must do this after calling configureLogging(),
+	# because we make the global variable 'log' available to the code in the config
+	# file.  We must also do this after parsing the command line, so that we know
+	# if this process is to be the daemon.
+	processConfigFile(options['--daemon'])
+
+	# Execute the command line.
+	if options['--start']:
+		# Start the daemon in the background.
+		status = startDaemon()
+
+		if status == '':
+			print('Started the EGD daemon.')
+		else:
+			print(status)
+
+	elif options['--stop']:
+		# Gracefully terminate the daemon.
+		status = stopDaemon()
+
+		if status == '':
+			print('Stopped the EGD daemon.')
+		else:
+			print(status)
+
+	elif options['--status']:
+		print(getDaemonStatus())
+		return 0
+
+	elif options['--sources']:
+		sources = getEntropySources()
+
+		if len(sources) == 0:
+			print("No entropy sources defined!")
+			return 0
+
+		for source in sources:
+			print('Entropy source:', source['name'])
+			print('  Interval:', source['interval'])
+			# UNDER CONSTRUCTION
+
+		return 0
+
+	elif options['--persist']:
+		# Persist the entropy pool.
+		status = persistPool()
+
+		if status == '':
+			print('Persisted the entropy pool to file "{0}"!'.format(config['persistFile']))
+		else:
+			print(status)
+
+	elif options['--daemon']:
+		# Secret option --daemon means to become the daemon in this process.
+		log.info('The daemon is PID {0}'.format(os.getpid()))
+
+		try:
+			return Daemon().run()
+
+		except:
+			log.exception('Exception during Daemon.run():')
+			log.info('Daemon (PID {0}) terminating!'.format(os.getpid()))
+			sys.exit(1)
+
+################################################################################
+# Bootstrap.
+
+if __name__ == '__main__':
+
+	# Parse and execute the command-line, exiting with the integer status returned
+	# from function commandLineInterface.
+	try:
+		status = commandLineInterface()
+
+	except:
+		log.exception('Exception during commandLineInterface:')
+		sys.exit(status)
+
+	finally:
+		log.info('PID {0} terminating!'.format(os.getpid()))
+		log.info('=' * 80)
