@@ -33,8 +33,8 @@ import sys, os, collections, re, threading, hashlib, logging, time, subprocess, 
 #
 # There are just a few globals in this module:
 #
-# o pool: This is the EntropyPool singleton.  Since it's what this module is all
-#   about, we make it global.
+# o pool: This is the EntropyPool singleton.  Since this object is what this module
+#   is all about, we make it global.
 #
 # o log: An alias for the logging module.  This is global to save typing for
 #   generating log messages.
