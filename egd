@@ -39,8 +39,8 @@ import sys, os, collections, re, threading, hashlib, logging, time, subprocess, 
 # o log: An alias for the logging module.  This is global to save typing for
 #   generating log messages.
 #
-# o havelzma: This is True if module lzma is available (Python 3.3 or later).  We use
-#   this in a few places to know whether to compress data with LZMA or BZ2.
+# o havelzma: This is True if module lzma is available (Python 3.3 or later),
+#   otherwise False.  We use this to know whether to compress data with LZMA or BZ2.
 
 if sys.version_info[0] > 3 or (sys.version_info[0] == 3 and sys.version_info[1] > 2):
 	# LZMA compression is only available in Python 3.3 and up.
