@@ -6,6 +6,8 @@
 #
 # Things to do:
 #
+# o Find out why "NOAA North America rainbow infrared satellite image" never loads.
+#
 # o Improve sendDaemonCommand so it can receive more than 1024 bytes from the daemon.
 #   Maybe have the daemon send the size of the data in the status line: "100 OK
 #   SIZE"?
@@ -1047,8 +1049,8 @@ class Daemon(Singleton):
 
 					pool = pickle.loads(persistedData)
 
-					log.info('De-persisted entropy pool from disk: {0} bytes of entropy in pool'
-							 .format(pool.entropyCount()))
+					log.info('De-persisted entropy pool from disk: {0} bytes of entropy in pool in {1} chunks'
+							 .format(pool.entropyCount(), pool.chunkCount()))
 
 				except:
 					log.exception('Exception while de-persisting the entropy pool from file {0}:'
