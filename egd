@@ -792,7 +792,8 @@ class EGDServer(Singleton):
 	def tcpServerThreadFunc(self):
 		'''This is the TCP server thread function.'''
 
-		log.debug('TCP server thread function entered: binding TCP server socket ...')
+		log.debug('TCP server thread function entered: binding TCP server socket to port {0}'
+				  .format(self.port))
 
 		# Store the daemon object reference in TCPRequestHandler so that method
 		# handle() can access it.
@@ -800,13 +801,15 @@ class EGDServer(Singleton):
 
 		# Create the server, binding to port config['tcpPort'] on localhost.
 		try:
-			self.server = socketserver.TCPServer(('localhost', config['tcpPort']), TCPRequestHandler)
+			log.debug('Constructing TCPServer object ...')
+			self.server = socketserver.TCPServer(('localhost', self.port), TCPRequestHandler)
 		except:
 			log.exception('Exception binding to localhost port {0} in socketserver.TCPServer:'
-						  .format(config['tcpPort']))
+						  .format(self.port))
 			return
 
 		try:
+			log.debug('Calling socketserver.TCPServer.serve_forever() ...')
 			self.server.serve_forever()
 		except:
 			log.exception('Exception in server.serve_forever:')
@@ -1002,15 +1005,17 @@ class Daemon(Singleton):
 				status = 1
 				return status
 
-			# Start the TCP server.
-			self.tcpServer = EGDServer(self)
-			self.tcpServer.start()
-
 			# Detach from terminal and become a daemon, but only under UNIX/Cygwin.  Python3
 			# can't do this on Windows.  Use pythonw.exe to run the daemon on Windows without
 			# showing a Command Prompt window.
 			if os.name == 'posix':
 				self.detachFromTerminal()
+
+			# Start the TCP server.  IMPORTANT: This MUST happen after we detach from
+			# the terminal, because function detachFromTerminal forks and exits the
+			# original process.
+			self.tcpServer = EGDServer(self)
+			self.tcpServer.start()
 
 			# Enable the entropy sources from the configuration file.  A key that starts
 			# with "source" has a value that is a dictionary defining an entropy source.
