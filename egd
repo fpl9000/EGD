@@ -18,6 +18,9 @@
 #
 # o Use subprocess.Popen to spawn the daemon with Windows Python.
 #
+# o Eliminate the magic string 'c:\apps\python32\pythonw.exe' in the code to spawn
+#   the daemon on Windows.
+#
 # o Finish the module's __doc__ string.
 #
 # Notes:
