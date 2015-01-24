@@ -216,7 +216,7 @@ def getNRLWorldSatelliteURL():
 source_NRLWorldSat = dict(name = 'NRL world visible/IR satellite image',
 						  interval = 10800,  # 3 hours
 						  urlfunction = getNRLWorldSatelliteURL,
-						  minsize = 20000,
+						  minsize = 30000,
 						  scale = 0.05)
 
 del getNRLWorldSatelliteURL
@@ -230,7 +230,7 @@ source_NRLNorthAmericaIRSat = dict(name = 'NRL North America visible/IR satellit
 								   interval = 54000,  # 15 hours
 								   url = 'http://www.nrlmry.navy.mil/htdocs_dyn_pregen_sat/PUBLIC/nexsat/gif89/CONUS/focus_regions/NorthAmerica-CONUS-x/x-x-x/vis_ir_background/goes/LATEST.gif',
 								   size = 1500000,
-								   minsize = 20000,
+								   minsize = 30000,
 								   scale = 0.008)
 
 # --------------------------------------------------------------------------------
@@ -248,7 +248,7 @@ def getNOAANorthAmericaWaterVaporSatelliteURL():
 source_NOAANorthAmericaWaterVaporSat = dict(name = 'NOAA North America water vapor satellite image',
 											interval = 10800,  # 1 hour
 											urlfunction = getNOAANorthAmericaWaterVaporSatelliteURL,
-											minsize = 20000,
+											minsize = 30000,
 											scale = 0.05)
 
 del getNOAANorthAmericaWaterVaporSatelliteURL
@@ -268,7 +268,7 @@ def getNOAANorthAmericaIRSatelliteURL():
 source_NOAANorthAmericaIRSat = dict(name = 'NOAA North America infrared satellite image',
 									interval = 10800,  # 1 hour
 									urlfunction = getNOAANorthAmericaIRSatelliteURL,
-									minsize = 20000,
+									minsize = 30000,
 									scale = 0.05)
 
 del getNOAANorthAmericaIRSatelliteURL
@@ -280,17 +280,27 @@ del getNOAANorthAmericaIRSatelliteURL
 source_NOAANorthAmericaRBIRSat = dict(name = 'NOAA North America rainbow infrared satellite image',
 									  interval = 10800,  # 1 hour
 									  url = 'http://www.ssd.noaa.gov/goes/comp/nhem/rb.jpg',
-									  minsize = 20000,
+									  minsize = 30000,
 									  scale = 0.008)
 
 # --------------------------------------------------------------------------------
-# NOAA GOES North America rainbow infrared satellite image.  Updated every ???.
+# NOAA GOES Eastern US rainbow infrared satellite image.  Updated every ??.
+# Entropy: ~110,000 bytes after compression/stirring and before scaling.
+
+source_NOAAEastUSRBIRSat = dict(name = 'NOAA East US rainbow infrared satellite image',
+									  interval = 10800,  # 1 hour
+									  url = 'http://www.ssd.noaa.gov/goes/east/eaus/rb.jpg',
+									  minsize = 30000,
+									  scale = 0.08)
+
+# --------------------------------------------------------------------------------
+# NOAA GOES East Atlantic rainbow infrared satellite image.  Updated every ???.
 # Entropy: ~120,000 bytes after compression/stirring and before scaling.
 
 source_NOAAEastAtlanticRBIRSat = dict(name = 'NOAA East Atlantic rainbow infrared satellite image',
 									  interval = 10800,  # 1 hour
 									  url = 'http://www.ssd.noaa.gov/eumet/eatl/rb.jpg',
-									  minsize = 20000,
+									  minsize = 30000,
 									  scale = 0.05)
 
 # --------------------------------------------------------------------------------
@@ -300,7 +310,7 @@ source_NOAAEastAtlanticRBIRSat = dict(name = 'NOAA East Atlantic rainbow infrare
 source_NOAANorthwestPacificRBIRSat = dict(name = 'NOAA Northwest Pacific rainbow infrared satellite image',
 										  interval = 10800,  # 1 hour
 										  url = 'http://www.ssd.noaa.gov/mtsat/nwpac/rb.jpg',
-										  minsize = 20000,
+										  minsize = 30000,
 										  scale = 0.05)
 
 # --------------------------------------------------------------------------------
