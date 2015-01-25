@@ -6,7 +6,8 @@
 #
 # Things to do:
 #
-# o Find out why "NOAA North America rainbow infrared satellite image" never loads.
+# o In class Daemon, refactor de-persisting the pool from method run() into a new
+#   method.
 #
 # o Improve sendDaemonCommand so it can receive more than 1024 bytes from the daemon.
 #   Maybe have the daemon send the size of the data in the status line: "100 OK
@@ -52,7 +53,7 @@ __doc__ = \
 	'''This module implements an Entropy Gathering Daemon (EGD).  Interactively, a
 	command-line interface allows control of the daemon process.  Module level
 	functions provide an API equivalent to the command-line interface.  Classes
-	implement the core features of the module API and the daemon.
+	implement the core functionality of the module API and the daemon.
 
 	UNDER CONSTRUCTION
 	'''
