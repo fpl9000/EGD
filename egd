@@ -73,7 +73,7 @@ def stirFunction(self, entropy):
 	subblock.
 	'''
 
-	# Create the hasher object.  We don't create a new hasher for trip through the
+	# Create the hasher object.  We don't create a new hasher each trip through the
 	# outer loop, so that hasher.update() builds each hash on the previous input to
 	# the hasher plus the data passed to update().
 	hasher = hashlib.sha256()
