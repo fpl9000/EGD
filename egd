@@ -80,7 +80,8 @@ def stirFunction(self, entropy):
 
 	# If self.entropy is zero bytes long, this is a zero-trip loop.
 	for subblockOffset in range(0, len(entropy), 32):
-		# Compute the hash, H.
+		# Compute the hash, H. This slice cannot overflow the array, thanks
+		# to Python's slice semantics.
 		hasher.update(entropy[subblockOffset:subblockOffset + 1024])
 		hash = hasher.digest()
 
