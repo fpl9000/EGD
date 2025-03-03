@@ -2,7 +2,7 @@
 
 An Entropy Gathering Daemon (EGD) written in Python 3.
 
-EGD requires Python 3.2, and will work with all later versions.
+EGD requires Python 3.2 or later.
 
 ## Command-Line Usage
 
